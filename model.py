@@ -9,8 +9,307 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.autograd import Variable
 import numpy as np
+from glob import glob
+
+import pytorch_msssim
+
+import pathlib
+import statistics
+import time
+import argparse
+import cv2
+import kornia
+import torch
+from torch import nn
+import torch.nn.functional as F
+from tqdm import tqdm
+import numpy as np
+import model as RetinexNet
+
+# from models.DenseNet_cat import DenseNet_half as Model
+from models.DenseNet_add import DenseNet_half as Model
+"""""
+class AttentionModule(nn.Module):
+    def __init__(self, in_channels, out_channels=16, alpha=5.0):
+        
+        super(AttentionModule, self).__init__()
+        self.alpha = alpha
+        self.attention_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0),
+            nn.ReLU(),
+            nn.Conv2d(out_channels, in_channels, kernel_size=7, stride=1, padding=3),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        pre_attention_map = torch.mul(x,torch.exp(-x * self.alpha))
+        print("pre_attention_map :", pre_attention_map.mean().item())
+        attention_map = self.attention_conv(x) * pre_attention_map
+        print("attention_map:", attention_map.mean().item())
+        return x * attention_map
+"""""
 
 
+"""""
+#CBAM
+class AttentionModule(nn.Module):
+    def __init__(self, dim, in_channels, ratio, kernel_size):
+        super(AttentionModule, self).__init__()
+        self.avg_pool = getattr(nn, "AdaptiveAvgPool{0}d".format(dim))(1)
+        self.max_pool = getattr(nn, "AdaptiveMaxPool{0}d".format(dim))(1)
+        conv_fn = getattr(nn, "Conv{0}d".format(dim))
+        self.fc1 = conv_fn(in_channels, in_channels // ratio, kernel_size=1, padding=0)
+        self.relu = nn.ReLU()
+        self.fc2 = conv_fn(in_channels // ratio, in_channels, kernel_size=1, padding=0)
+        self.sigmoid = nn.Sigmoid()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+        self.conv = conv_fn(2, 1, kernel_size=kernel_size, stride=1, padding=padding)
+
+    def forward(self, x):
+        # Channel attention module:（Mc(f) = σ(MLP(AvgPool(f)) + MLP(MaxPool(f)))）
+        module_input = x
+        avg = self.fc2(self.relu(self.fc1(self.avg_pool(x))))
+        mx = self.fc2(self.relu(self.fc1(self.max_pool(x))))
+        x = self.sigmoid(avg + mx)
+        x = module_input * x
+        # Spatial attention module:Ms (f) = σ( f7×7( AvgPool(f) ; MaxPool(F)] )))
+        module_input = x
+        avg = torch.mean(x, dim=1, keepdim=True)
+        mx, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat((avg, mx), dim=1)
+        x = self.sigmoid(self.conv(x))
+        x = module_input * x
+        return x
+"""""
+
+"""""
+class AttentionModule(nn.Module):
+    def __init__(self, in_channels, kernel_size=7):
+        super(AttentionModule, self).__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+        
+        # Spatial attention part
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, stride=1, padding=padding)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        module_input = x
+
+        # Weight the dark regions more
+        weighted_input = torch.exp(-module_input) * module_input
+
+        avg = torch.mean(weighted_input, dim=1, keepdim=True)
+        mx, _ = torch.max(weighted_input, dim=1, keepdim=True)
+        x = torch.cat((avg, mx), dim=1)
+        x = self.sigmoid(self.conv(x))
+        return module_input * x
+"""""
+"""""
+class AttentionModule(nn.Module):
+    def __init__(self, in_channels, kernel_size=7):
+        super(AttentionModule, self).__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = kernel_size // 2  # Use integer division for dynamic padding based on kernel size
+        
+        # Spatial attention part
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, stride=1, padding=padding)
+        self.sigmoid = nn.Sigmoid()
+        self.beta = 0.2  # A threshold to define what is considered as dark
+
+    def forward(self, x):
+        module_input = x
+
+        # Calculate a mask where the dark regions are 1 and the rest are close to 0
+        dark_mask = torch.sigmoid((self.beta - module_input) * 10)  # Scale factor to sharpen the mask
+
+        # Apply the mask to the input by adding emphasis to the dark regions
+        weighted_input = module_input * dark_mask
+
+        # Calculate the average and max values across the weighted input's channel dimension
+        avg_weighted = torch.mean(weighted_input, dim=1, keepdim=True)
+        max_weighted, _ = torch.max(weighted_input, dim=1, keepdim=True)
+
+        # Combine the average and max weighted features
+        combined = torch.cat((avg_weighted, max_weighted), dim=1)
+
+        # Apply the spatial attention mechanism
+        attention_map = self.sigmoid(self.conv(combined))
+
+        # Multiply the original input with the attention map to enhance dark regions
+        return module_input * attention_map
+"""""
+
+class Fuse:
+    """
+    fuse with infrared folder and visible folder
+    """
+
+    def __init__(self, model_path: str):
+        """
+        :param model_path: path of pre-trained parameters
+        """
+
+        # device
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device
+        # model parameters
+        params = torch.load(model_path, map_location='cpu')
+
+        self.net = Model()
+
+        self.net.load_state_dict(params['net'])
+        
+        self.net.to(device)
+        
+        self.net.eval()
+
+    def __call__(self, ir_folder: str, vi_folder: str, dst: str, fuse_type = None):
+        """
+        fuse with ir folder and vi folder and save fusion image into dst
+        :param ir_folder: infrared image folder
+        :param vi_folder: visible image folder
+        :param dst: fusion image output folder
+        """
+
+        para = sum([np.prod(list(p.size())) for p in self.net.parameters()])
+        print('Model params: {:}'.format(para))
+
+        # image list
+        ir_folder = pathlib.Path(ir_folder)
+        vi_folder = pathlib.Path(vi_folder)
+        ir_list = sorted([x for x in sorted(ir_folder.glob('*')) if x.suffix in ['.bmp', '.png', '.jpg', '.JPG']])
+        vi_list = sorted([x for x in sorted(vi_folder.glob('*')) if x.suffix in ['.bmp', '.png', '.jpg', '.JPG']])
+
+
+        print(f"IR images count: {len(ir_list)}")
+        print(f"VI images count: {len(vi_list)}")
+
+        if len(ir_list) == 0 or len(vi_list) == 0:
+            print("No images found. Please check the directory paths.")
+            return
+
+
+        # check image name and fuse
+        fuse_time = []
+        rge = tqdm(zip(ir_list, vi_list))
+
+        for ir_path, vi_path in rge:
+            start = time.time()
+
+            # check image name
+            ir_name = ir_path.stem
+            vi_name = vi_path.stem
+            rge.set_description(f'fusing {ir_name}')
+            # assert ir_name == vi_name
+
+            # read image
+            ir, vi = self._imread(str(ir_path), str(vi_path), fuse_type = fuse_type)
+            ir = ir.unsqueeze(0).to(self.device)
+            vi = vi.unsqueeze(0).to(self.device)
+
+            # network forward
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            fu = self._forward(ir, vi)
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+
+
+            # save fusion tensor
+            fu_path = pathlib.Path(dst, ir_path.name)
+            self._imsave(fu_path, fu)
+
+            end = time.time()
+            fuse_time.append(end - start)
+        
+        # time analysis
+        if len(fuse_time) > 2:
+            mean = statistics.mean(fuse_time[1:])
+            print('fps (equivalence): {:.2f}'.format(1. / mean))
+
+        else:
+            print(f'fuse avg time: {fuse_time[0]:.2f}')
+
+
+    @torch.no_grad()
+    def _forward(self, ir: torch.Tensor, vi: torch.Tensor) -> torch.Tensor:
+        fusion = self.net(ir, vi)
+        return fusion
+
+    @staticmethod
+    def _imread(ir_path: str, vi_path: str, flags=cv2.IMREAD_GRAYSCALE, fuse_type = None) -> torch.Tensor:
+        ir_cv = cv2.imread(ir_path, flags).astype('float32')
+        
+        vi_cv = cv2.imread(vi_path, flags).astype('float32')
+        height, width = ir_cv.shape[:2]
+            
+        ir_ts = kornia.utils.image_to_tensor(ir_cv / 255.0).type(torch.FloatTensor)
+        vi_ts = kornia.utils.image_to_tensor(vi_cv / 255.0).type(torch.FloatTensor)
+        return ir_ts, vi_ts
+
+    @staticmethod
+    def _imsave(path: pathlib.Path, image: torch.Tensor):
+        im_ts = image.squeeze().cpu()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        im_cv = kornia.utils.tensor_to_image(im_ts) * 255.
+        cv2.imwrite(str(path), im_cv)
+
+
+
+
+
+
+"""""
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.fc1 = nn.Conv2d(in_channels, in_channels // ratio, 1, bias=False)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Conv2d(in_channels // ratio, in_channels, 1, bias=False)
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+"""""
+
+class SpatialAttention(nn.Module):
+    def __init__(self, in_channels, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = kernel_size // 2  
+
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, stride=1, padding=padding)
+        self.sigmoid = nn.Sigmoid()
+
+        self.beta = 0.1 
+        self.alpha = 0.8  
+
+    def forward(self, x):
+        module_input = x
+
+        dark_enhanced = torch.tanh((self.beta - module_input) * 10)
+        #light_suppressed = torch.tanh((module_input - self.beta) * 5) * self.alpha
+
+        #weighted_mask = dark_enhanced * light_suppressed
+        weighted_mask = dark_enhanced
+
+        avg_weighted = torch.mean(weighted_mask, dim=1, keepdim=True)
+        max_weighted, _ = torch.max(weighted_mask, dim=1, keepdim=True)
+
+        combined = torch.cat((avg_weighted, max_weighted), dim=1)
+        attention_map = self.sigmoid(self.conv(combined))
+
+        return module_input * attention_map
+
+
+
+"""""
 class DecomNet(nn.Module):
     def __init__(self, channel=32, kernel_size=3):
         super(DecomNet, self).__init__()
@@ -36,7 +335,7 @@ class DecomNet(nn.Module):
         # Final recon layer
         self.net1_recon = nn.Conv2d(channel, 2, kernel_size,
                                     padding=1, padding_mode='replicate')
-
+ 
     def forward(self, input_im):
         input_max= torch.max(input_im, dim=1, keepdim=True)[0]
         input_img= torch.cat((input_max, input_im), dim=1)
@@ -45,8 +344,41 @@ class DecomNet(nn.Module):
         outs     = self.net1_recon(featss)
         R        = torch.sigmoid(outs[:, 0:1, :, :])
         L        = torch.sigmoid(outs[:, 1:2, :, :])
-        return R, L
 
+        return R, L 
+"""""
+class DecomNet(nn.Module):
+    def __init__(self, channel=16, kernel_size=3):
+        super(DecomNet, self).__init__()
+        self.net1_conv0 = nn.Conv2d(2, channel, kernel_size * 3, padding=4, padding_mode='replicate')
+        self.net1_convs = nn.Sequential(nn.Conv2d(channel, channel, kernel_size, padding=1, padding_mode='replicate'),
+                                        nn.ReLU(),
+                                        nn.Conv2d(channel, channel, kernel_size, padding=1, padding_mode='replicate'),
+                                        nn.ReLU(),
+                                        nn.Conv2d(channel, channel, kernel_size, padding=1, padding_mode='replicate'),
+                                        nn.ReLU(),
+                                        nn.Conv2d(channel, channel, kernel_size, padding=1, padding_mode='replicate'),
+                                        nn.ReLU(),
+                                        nn.Conv2d(channel, channel, kernel_size, padding=1, padding_mode='replicate'),
+                                        nn.ReLU())
+        self.net1_recon = nn.Conv2d(channel, 2, kernel_size, padding=1, padding_mode='replicate')
+
+        #self.channel_attention = ChannelAttention(channel)
+        self.spatial_attention = SpatialAttention(in_channels=1)
+
+    def forward(self, input_im):
+        input_max = torch.max(input_im, dim=1, keepdim=True)[0]
+        input_img = torch.cat((input_max, input_im), dim=1)
+        feats0 = self.net1_conv0(input_img)
+        #feats0 = self.channel_attention(feats0)
+        feats0 = self.spatial_attention(feats0)
+        featss = self.net1_convs(feats0)
+        outs = self.net1_recon(featss)
+        R = torch.sigmoid(outs[:, 0:1, :, :])
+        L = torch.sigmoid(outs[:, 1:2, :, :])
+
+        return R, L
+"""""
 class RelightNet(nn.Module):
     def __init__(self, channel=32, kernel_size=3):
         super(RelightNet, self).__init__()
@@ -73,8 +405,12 @@ class RelightNet(nn.Module):
                                      padding=1, padding_mode='replicate')
         self.net2_output = nn.Conv2d(channel, 1, kernel_size=3, padding=0)
 
+
     def forward(self, input_L, input_R):
         input_img = torch.cat((input_R, input_L), dim=1)
+
+        input_img = self.attention(input_img)
+
         out0      = self.net2_conv0_1(input_img)
         out1      = self.relu(self.net2_conv1_1(out0))
         out2      = self.relu(self.net2_conv1_2(out1))
@@ -93,20 +429,103 @@ class RelightNet(nn.Module):
         feats_fus = self.net2_fusion(feats_all)
         output    = self.net2_output(feats_fus)
         return output
+"""""
+
+class RelightNet(nn.Module):
+    def __init__(self, channel=16, kernel_size=3):
+        super(RelightNet, self).__init__()
+        self.relu = nn.ReLU()
+        self.net2_conv0_1 = nn.Conv2d(2, channel, kernel_size, padding=1, padding_mode='replicate')
+        self.net2_conv1_1 = nn.Conv2d(channel, channel, kernel_size, stride=2, padding=1, padding_mode='replicate')
+        self.net2_conv1_2 = nn.Conv2d(channel, channel, kernel_size, stride=2, padding=1, padding_mode='replicate')
+        self.net2_conv1_3 = nn.Conv2d(channel, channel, kernel_size, stride=2, padding=1, padding_mode='replicate')
+        self.net2_deconv1_1 = nn.Conv2d(channel*2, channel, kernel_size, padding=1, padding_mode='replicate')
+        self.net2_deconv1_2 = nn.Conv2d(channel*2, channel, kernel_size, padding=1, padding_mode='replicate')
+        self.net2_deconv1_3 = nn.Conv2d(channel*2, channel, kernel_size, padding=1, padding_mode='replicate')
+        self.net2_fusion = nn.Conv2d(channel*3, channel, kernel_size=1, padding=1, padding_mode='replicate')
+        self.net2_output = nn.Conv2d(channel, 1, kernel_size=3, padding=0)
+
+        #self.channel_attention = ChannelAttention(channel)
+        self.spatial_attention = SpatialAttention(in_channels=1)
+
+    def forward(self, input_L, input_R):
+        input_img = torch.cat((input_R, input_L), dim=1)
+
+        out0 = self.net2_conv0_1(input_img)
+        out0 = self.spatial_attention(out0)
+
+        out1 = self.relu(self.net2_conv1_1(out0))
+        out1 = self.spatial_attention(out1)
+
+        out2 = self.relu(self.net2_conv1_2(out1))
+        out2 = self.spatial_attention(out2)
+
+        out3 = self.relu(self.net2_conv1_3(out2))
+        out3_up = F.interpolate(out3, size=(out2.size()[2], out2.size()[3]))
+
+        deconv1 = self.relu(self.net2_deconv1_1(torch.cat((out3_up, out2), dim=1)))
+        deconv1 = self.spatial_attention(deconv1)
+
+        deconv1_up = F.interpolate(deconv1, size=(out1.size()[2], out1.size()[3]))
+        deconv1_up = self.spatial_attention(deconv1_up)
+
+        deconv2 = self.relu(self.net2_deconv1_2(torch.cat((deconv1_up, out1), dim=1)))
+        deconv2 = self.spatial_attention(deconv2)
+
+        deconv2_up = F.interpolate(deconv2, size=(out0.size()[2], out0.size()[3]))
+        deconv2_up = self.spatial_attention(deconv2_up)
+
+        deconv3 = self.relu(self.net2_deconv1_3(torch.cat((deconv2_up, out0), dim=1)))
+        deconv3 = self.spatial_attention(deconv3)
+
+        deconv1_rs = F.interpolate(deconv1, size=(input_R.size()[2], input_R.size()[3]))
+        deconv1_rs = self.spatial_attention(deconv1_rs)
+
+        deconv2_rs = F.interpolate(deconv2, size=(input_R.size()[2], input_R.size()[3]))
+        deconv2_rs = self.spatial_attention(deconv2_rs)
+
+        feats_all = torch.cat((deconv1_rs, deconv2_rs, deconv3), dim=1)
+        feats_fus = self.net2_fusion(feats_all)
+
+        output = self.net2_output(feats_fus)
+
+        return output
+    
+
+
+
 
 
 class RetinexNet(nn.Module):
-    def __init__(self):
+    def __init__(self, fuse_model_path):
         super(RetinexNet, self).__init__()
 
-        self.DecomNet  = DecomNet()
-        self.RelightNet= RelightNet()
+        # Initialize Fuse model
+        self.fuse_model = Fuse(fuse_model_path)
+
+        self.DecomNet = DecomNet()
+        self.RelightNet = RelightNet()
+
+
+        #self.channel_attention = ChannelAttention(in_channels=1) 
+        self.spatial_attention = SpatialAttention(in_channels=1)
+
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+   
 
     def forward(self, input_low, input_high):
-        # Forward DecompNet
-        input_low = Variable(torch.FloatTensor(torch.from_numpy(input_low))).cuda()
-        input_high= Variable(torch.FloatTensor(torch.from_numpy(input_high))).cuda()
-        R_low, I_low   = self.DecomNet(input_low)
+        # Convert numpy to tensor and send to device
+
+        input_low = torch.FloatTensor(input_low).to(self.device)
+        input_high = torch.FloatTensor(input_high).to(self.device)
+        # Apply Channel and Spatial Attention
+        #input_low = self.channel_attention(input_low)
+        input_low = self.spatial_attention(input_low)
+        #input_high = self.channel_attention(input_high)
+        #input_high = self.spatial_attention(input_high)
+
+
+        R_low, I_low = self.DecomNet(input_low)
         R_high, I_high = self.DecomNet(input_high)
 
         # Forward RelightNet
@@ -116,6 +535,7 @@ class RetinexNet(nn.Module):
         # I_low_3  = torch.cat((I_low, I_low, I_low), dim=1)
         # I_high_3 = torch.cat((I_high, I_high, I_high), dim=1)
         # I_delta_3= torch.cat((I_delta, I_delta, I_delta), dim=1)
+
 
         # Compute losses
         self.recon_loss_low  = F.l1_loss(R_low * I_low,  input_low)
@@ -129,20 +549,50 @@ class RetinexNet(nn.Module):
         self.Ismooth_loss_high  = self.smooth(I_high, R_high)
         self.Ismooth_loss_delta = self.smooth(I_delta, R_low)
 
+
+        # dark loss
+        beta = 0.1
+        dark_parts_low = torch.where(input_low < beta, input_low, torch.zeros_like(input_low))
+        dark_parts_high = torch.where(input_high < beta, input_high, torch.zeros_like(input_high))
+        
+        dark_loss = F.l1_loss(dark_parts_low, dark_parts_high)
+
+
+
         self.loss_Decom = self.recon_loss_low + \
-                          self.recon_loss_high + \
-                          0.001 * self.recon_loss_mutal_low + \
-                          0.001 * self.recon_loss_mutal_high + \
-                          0.1 * self.Ismooth_loss_low + \
-                          0.1 * self.Ismooth_loss_high + \
-                          0.01 * self.equal_R_loss
-        self.loss_Relight = self.relight_loss + \
-                            3 * self.Ismooth_loss_delta
+                        self.recon_loss_high + \
+                        0.001 * self.recon_loss_mutal_low + \
+                        0.001 * self.recon_loss_mutal_high + \
+                        0.1 * self.Ismooth_loss_low + \
+                        0.1 * self.Ismooth_loss_high + \
+                        0.01 * self.equal_R_loss 
+        print("self.loss_Decom:",self.loss_Decom)
+
+
+
+        # ssim + relight (loss)
+        num_channels = input_high.size(1)  
+        ssim_module = pytorch_msssim.SSIM(data_range=1.0, channel=num_channels)
+        ssim_loss = 1 - ssim_module(input_high, R_low * I_delta)
+
+        self.loss_Relight = 0.5 * (self.relight_loss + \
+                            3 * self.Ismooth_loss_delta) + \
+                            0.5 * (ssim_loss) + \
+                            0 * dark_loss 
+                            
+
+                             
 
         self.output_R_low   = R_low.detach().cpu()
         self.output_I_low   = I_low.detach().cpu()
         self.output_I_delta = I_delta.detach().cpu()
         self.output_S       = R_low.detach().cpu() * I_delta.detach().cpu()
+
+
+
+
+
+
 
     def gradient(self, input_tensor, direction):
         self.smooth_kernel_x = torch.FloatTensor([[0, 0], [-1, 1]]).view((1, 1, 2, 2)).cuda()
@@ -215,6 +665,7 @@ class RetinexNet(nn.Module):
             torch.save(self.RelightNet.state_dict(),save_name)
 
     def load(self, ckpt_dir):
+
         load_dir   = ckpt_dir + '/' + self.train_phase + '/'
         if os.path.exists(load_dir):
             load_ckpts = os.listdir(load_dir)
@@ -340,6 +791,7 @@ class RetinexNet(nn.Module):
                     loss = self.loss_Decom.item()
                 elif self.train_phase == "Relight":
                     self.train_op_Relight.zero_grad()
+                    
                     self.loss_Relight.backward()
                     self.train_op_Relight.step()
                     loss = self.loss_Relight.item()
@@ -357,10 +809,24 @@ class RetinexNet(nn.Module):
         print("Finished training for phase %s." % train_phase)
 
 
+
     def predict(self,
                 test_low_data_names,
-                res_dir,
-                ckpt_dir):
+                res_dir,temp_dir,
+                ckpt_dir, ir_folder, vi_folder):
+
+        ir_list = glob(os.path.join(ir_folder, '*.*'))
+        vi_list = glob(os.path.join(vi_folder, '*.*'))
+
+        self.fuse_model(ir_folder, vi_folder, res_dir)
+
+
+        test_low_data_names = glob(os.path.join(res_dir, '*.*'))
+
+        if not test_low_data_names:
+            print("No images found in temp_dir for enhancement.")
+            return
+        
 
         # Load the network with a pre-trained checkpoint
         self.train_phase= 'Decom'
@@ -394,9 +860,9 @@ class RetinexNet(nn.Module):
             input_low_test = np.expand_dims(test_low_img, axis=0)
             print(input_low_test.shape)
 
+            input_low_tensor = torch.from_numpy(input_low_test).float()
 
-            self.forward(input_low_test, input_low_test)
-            self.forward(input_low_test, input_low_test)
+            self.forward(input_low_tensor, input_low_tensor)
             result_1 = self.output_R_low
             result_2 = self.output_I_low
             result_3 = self.output_I_delta
@@ -416,26 +882,87 @@ class RetinexNet(nn.Module):
             print(input.dtype)
             print(result_4.dtype)
             
-            alpha = 0.5  
+            mean_brightness = input_low_tensor.mean()
+
+            if 0.2 < mean_brightness < 0.5: 
+                alpha = 0.5 * (1 + mean_brightness)  # Smaller weight for moderately bright images
+            elif mean_brightness > 0.5: 
+                alpha = 1  # Larger weight for bright images
+            else:
+                alpha = 0.5  # Default weight for dark images
+
             result_4 = result_4.cpu().numpy()
             cat_image = alpha * input + (1 - alpha) * result_4
-
+            cat_image = np.clip(cat_image, 0, 1)
             
             im = Image.fromarray(np.uint8(cat_image[0, 0] * 255.0))
             filepath = res_dir + '/' + test_img_name
-            im.save(filepath[:-4] + '.jpg')
-
-            """
-            cat_image = np.concatenate((input, result_4), axis=2)
-            
-            print(cat_image.shape)
-
-            #im = Image.fromarray(np.squeeze(np.clip(cat_image * 255.0, 0, 255.0)).astype(np.uint8))
-
-            cat_image = cat_image[0, 0, :, :]
-            im = Image.fromarray(np.clip(cat_image * 255.0, 0, 255.0).astype(np.uint8))
+            im.save(filepath[:-4] + '.png')
 
 
+
+
+
+
+    """""
+    def predict(self, test_low_data_names, res_dir, ckpt_dir):
+        # Load the network with a pre-trained checkpoint
+        self.train_phase = 'Decom'
+        load_model_status, _ = self.load(ckpt_dir)
+        if load_model_status:
+            print(self.train_phase, "  : Model restore success!")
+        else:
+            print("No pretrained model to restore!")
+            raise Exception
+
+        self.train_phase = 'Relight'
+        load_model_status, _ = self.load(ckpt_dir)
+        if load_model_status:
+            print(self.train_phase, ": Model restore success!")
+        else:
+            print("No pretrained model to restore!")
+            raise Exception
+
+        # Set this switch to True to also save the reflectance and shading maps
+        save_R_L = False
+        
+        # Predict for the test images
+        for idx in range(len(test_low_data_names)):
+            test_img_path = test_low_data_names[idx]
+            test_img_name = test_img_path.split('/')[-1]
+            print('Processing ', test_img_name)
+
+            test_low_img = Image.open(test_img_path).convert('L')
+            test_low_img = np.array(test_low_img, dtype="float32") / 255.0
+            test_low_img = np.tile(test_low_img, (1, 1, 1))
+            input_low_test = np.expand_dims(test_low_img, axis=0)
+
+            # Convert the image to a PyTorch tensor and apply the dark mask operation
+            input_low_tensor = torch.from_numpy(input_low_test).float()
+            dark_enhanced = torch.tanh((0.1 - input_low_tensor) * 5)
+
+            # Use dark_enhanced as input to the forward pass
+            self.forward(dark_enhanced, dark_enhanced)
+            result_1 = self.output_R_low
+            result_2 = self.output_I_low
+            result_3 = self.output_I_delta
+            result_4 = self.output_S
+
+            # Extract results and process
+            input = np.squeeze(input_low_test)
+            result_1 = np.squeeze(result_1)
+            result_2 = np.squeeze(result_2)
+            result_3 = np.squeeze(result_3)
+            result_4 = np.squeeze(result_4)
+
+            # Combine the input and result for final output
+            alpha = 0.5
+            result_4 = result_4.cpu().numpy()
+            cat_image = alpha * input + (1 - alpha) * result_4
+            cat_image = np.clip(cat_image, 0, 1)
+
+            # Convert the result to an image and save it
+            im = Image.fromarray(np.uint8(cat_image[0, 0] * 255.0))
             filepath = res_dir + '/' + test_img_name
             im.save(filepath[:-4] + '.jpg')
-            """
+        """""

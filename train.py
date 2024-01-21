@@ -22,6 +22,7 @@ parser.add_argument('--data_dir', dest='data_dir',
 parser.add_argument('--ckpt_dir', dest='ckpt_dir', default='./ckpts/',
                     help='directory for checkpoints')
 
+
 args = parser.parse_args()
 
 def train(model):
@@ -29,9 +30,9 @@ def train(model):
     lr = args.lr * np.ones([args.epochs])
     lr[20:] = lr[0] / 10.0
 
-    train_low_data_names = glob(r'/home/khome_linux/densefuse/gray_lol_raise_prof.f_2110_training_image/prof.f/low_vis/*.png')+glob(r'/home/khome_linux/densefuse/gray_lol_raise_prof.f_2110_training_image/485_low/GRAY_8bit/*.png')+glob(r'/home/khome_linux/densefuse/gray_lol_raise_prof.f_2110_training_image/BrighteningTrain/gray/low/*.png')
+    train_low_data_names = glob(r'/home/khome_linux/densefuse/gray_lol_raise_prof.f_2110_training_image/prof.f/low_fusion/*.png')+glob(r'/home/khome_linux/densefuse/gray_lol_raise_prof.f_2110_training_image/485_low/GRAY_8bit/*.png')+glob(r'/home/khome_linux/densefuse/gray_lol_raise_prof.f_2110_training_image/BrighteningTrain/gray/low/*.png')+glob(r'/home/khome_linux/densefuse/gray_lol_raise_prof.f_2110_training_image/MSRS-main/train/fusion/low/*.png')+glob('/home/khome_linux/densefuse/gray_lol_raise_prof.f_2110_training_image/RELLISUR-Dataset/Train/LLLR/*.png')
     train_low_data_names.sort()
-    train_high_data_names= glob(r'/home/khome_linux/densefuse/gray_lol_raise_prof.f_2110_training_image/prof.f/high_vis_engan/fake/*.png')+glob(r'/home/khome_linux/densefuse/gray_lol_raise_prof.f_2110_training_image/485_high/GRAY_8bit/*.png')+glob(r'/home/khome_linux/densefuse/gray_lol_raise_prof.f_2110_training_image/BrighteningTrain/gray/high/*.png')
+    train_high_data_names= glob(r'/home/khome_linux/densefuse/gray_lol_raise_prof.f_2110_training_image/prof.f/high_fusion/*.png')+glob(r'/home/khome_linux/densefuse/gray_lol_raise_prof.f_2110_training_image/485_high/GRAY_8bit/*.png')+glob(r'/home/khome_linux/densefuse/gray_lol_raise_prof.f_2110_training_image/BrighteningTrain/gray/high/*.png')+glob(r'/home/khome_linux/densefuse/gray_lol_raise_prof.f_2110_training_image/MSRS-main/train/fusion/high/*.png')+glob('/home/khome_linux/densefuse/gray_lol_raise_prof.f_2110_training_image/RELLISUR-Dataset/Train/NLHR/X1/*.png')
     train_high_data_names.sort()
     eval_low_data_names  = glob(args.data_dir + '/eval/low/*.*')
     eval_low_data_names.sort()
